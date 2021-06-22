@@ -1,0 +1,11 @@
+在我们分析这个db_bench的详细功能前，把它支持的相关参数梳理一遍：
+
+blob_compression_type        Integrated BlobDB
+blob_db_bytes_per_sync        Stacked BlobDB
+blob_db_compression_type      Stacked BlobDB   blob文件采用的压缩算法，默认是 snappy
+
+
+
+
+
+db_bench 的核心实现逻辑：

@@ -1,3 +1,151 @@
+如何压测rocksdb
+------
+压测rocksdb引擎，有两种思路：
+
+1. 自己写一个benchmark工具：
+根据自己关心的kv pattern和access pattern，生成对应的kv pairs，然后入库，并发起对应的请求，最后收集结果。
+通常不同类型的数据库都有符合不同数据模型的负载模型和不同的建模，如：TP型数据库的TPCxxx，AP型数据库的xxxx，图数据库的LDBC等。
+这类思路下有很多相关工具，如：
+<!--more-->
+  * YCSB（标准化了一系列workload，分发给不同的db引擎，其中包含rocksdb）
+  * sysbench
+  * influxdb搞的influxdb-comparisons
+  * dgraph的badger-bench
+  还有其他很多，就不举例了。
+
+2. 使用rocksdb已提供的benchmark工具`db_bench`, 这个工具是fb根据自己的业务搞的一个benchmark工具，内部提供了一些workload模型，包括
+fillseq，fillrandom，mixgraph等，也有一些文章是讲述fb在workload的一些工作的，如fast20的一篇文章[1]和sigmod13的一篇文章[2]。
+
+[1] https://www.usenix.org/system/files/fast20-cao_zhichao.pdf
+[2] http://people.cs.uchicago.edu/~tga/pubs/sigmod-linkbench-2013.pdf
+
+workload study实际上在存储中是一门很复杂的学问，但整体逻辑基本上绕不开以下几个问题：
+ - tracing: 类似于profiling，在关键链路上进行打点，并逐条输出感兴趣的参数，比如读研时，针对块设备我们经常在submit_bio这个内核参数上打出一个io的提交时间，
+ 偏移量，大小，...，最后形成1个Trace文件，后续可利用工具直接回放这些Trace数据进行性能之类的分析。
+
+ - simulation：例如读研时体系结构这门课涉及的微软开发的磁盘模拟程序disksim.
+
+ - modeling: 更偏向于统计和数学建模，例如[1]里fb就对实际应用中抓取到的trace进行了建模分析，最后得出一个请求的广义帕累托分布分布模型，后续可利用这些模型进行规范化的trace生成。
+
+我们就来探索一下`db_bench`，由于rocksdb的积累也是比较深厚，`db_bench`提供了一大堆参数，令人眼花缭乱，这里就简单抛砖引玉一下。本文重点之一是需要解决一个疑问，bench写入的key，怎么保证在读时一定能读到呢？
+
+Benchmark的核心实现逻辑
+-------
+
+
+
+测试key的生成逻辑
+--------
+
+1. key的生成方式是由一个u64数字生成指定长度的字符串。
+
+**GenerateKeyFromInt**
+**GenerateKeyFromIntForSeek**
+
+key生成逻辑大体如下：
+
+给定u64数字v和key长度s，得到长度为s的字符串：f(v, s)
+前8个字节：
+```
+for (int i = 0; i < bytes_to_fill; ++i) {
+  pos[i] = (v >> ((bytes_to_fill - i - 1) << 3)) & 0xFF;
+}
+```
+
+剩余的字节以’\0‘填充.
+
+如果指定了前缀的长度，首先会根据v生成对应的前缀数字v1，而后前缀也以类似的方式由v1生成。
+
+整体key大约类似这种形式：f(v1, prefix_len) + f(v, key_size - prefix_len)
+
+2. 数字v是怎么来的：
+
+定义了3种workload生成方式：随机，顺序，唯一随机。
+随机就是简单生成随机数u64并对num_keys取模。
+顺序就是从0累加到num_keys。
+唯一随机就是生成1个长度为num_keys数组,并随机打乱，然后依次吐出数字。
+
+测试value的生成逻辑
+---------
+
+打表法，提前生成好一个大片内存为随机字符，而后按需从中取一段任意长度作为随机字符串。
+
+
+几种自带负载以及相关参数分析
+-----------
+
+kv pattern相关参数
+---------
+key大小，key分布，range，prefix
+-key_size         key大小
+-keys_per_prefix  每个prefix的key数目
+-prefix_size      prefix大小
+
+-key_id_range   时序数据相关参数
+
+-keyrange_num     mixgraph负载相关参数
+-key_dist_a       mixgraph
+-key_dist_b       mixgraph
+-keyrange_dist_a    *
+-keyrange_dist_b    *
+-keyrange_dist_c    *
+-keyrange_dist_d    *
+
+value大小，value分布，valuesize分布
+-value_size          *
+
+-value_k      mixgraph
+-value_sigma    *
+-value_theta    *
+-value_size_distribution_type FIXED,固定大小
+-value_size_max         -
+-value_size_min         -
+
+测试整体配置
+-----------
+-seed
+-use_existing_db          使用已存在的DB（否则清空）
+-batch_size             一次提交的Batch大小
+-perf_level             定义了rocksdb的perf-level
+-use_existing_keys          若enbale，则会在初始化时，把db中的所有key捞到内存中，后续生成key时，使用这些key。
+-num_column_families        测试使用的cf数
+-num                读写的key数目
+-numdistinct
+-writes               写操作次数
+-options_file             xxx
+-threads              测试线程数
+
+seek相关
+---------
+-seek_nexts             迭代器seek到key（对于seekrandom，该key是随机生成的）后,继续调用迭代器next的次数
+-max_scan_distance          定义了迭代器的上下界，是read Option中的iterate_lower_bound（reverse迭代）和iterate_upper_bound（普通迭代）
+-reverse_iterator         是否reverse迭代，也是readOption的一个选项,
+-use_tailing_iterator       https://github.com/facebook/rocksdb/wiki/Tailing-Iterator
+-total_order_seek         ReadOptions
+-prefix_same_as_start       ReadOptions
+-readahead_size           ReadOptions::readahead_size. If non-zero, NewIterator will create a new table reader which performs reads of the given size.
+-seek_missing_prefix        迭代器seek的key中的prefix一定是不存在的。对一个不存在的key进行seek操作。
+
+
+delete-range查询相关
+----------------
+-writes_per_range_tombstone     若干次Put之后，插入一个DeleteRange，只有这个参数大于0，后续几个参数（expand_range_tombstones）才会生效。
+-expand_range_tombstones      在writes_per_range_tombstone参数的基础上，把delete-range等价换为若干次对单key的delete。
+-range_tombstone_width        在writes_per_range_tombstone参数的基础上，定义了插入的delete-range的range范围，该range范围是next key对应的v+range_tombstone_width
+-writes_before_delete_range     在writes_per_range_tombstone参数的基础上, 定义了至少写了多少次，才触发delete-range。
+-max_num_range_tombstones       在writes_per_range_tombstone参数的基础上, 定义了整个benchmark中最多能有几次delete-range。
+
+
+限速相关
+--------
+-benchmark_read_rate_limit      发压侧读限速
+-benchmark_write_rate_limit     发压侧写限速
+-sine_write_rate          sine wave write_rate_limit
+-iter_k               mixgraph
+-iter_sigma             *
+-iter_theta             *
+
+
 在我们分析这个db_bench的详细功能前，把它支持的相关参数梳理一遍：
 
 blob_compression_type        Integrated BlobDB
@@ -7,5 +155,3 @@ blob_db_compression_type      Stacked BlobDB   blob文件采用的压缩算法�
 
 
 
-
-db_bench 的核心实现逻辑：

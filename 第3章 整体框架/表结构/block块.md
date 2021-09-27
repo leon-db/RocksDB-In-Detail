@@ -69,4 +69,18 @@ restart  (组的首地址偏移地址)
 restart num (组数)
 ```
 
+# Block块表示
+数据从磁盘提取出来，需要在内存中体现，这个数据结构就是 BlockContents, 同时考虑效率的问题。
+数据只保存了一个Slice
+```c++
+Slice data;      // 实际的数据内容
+bool cachable;   // 数据是否可以被cache
+CompressionType compression_type; // 数据的压缩类型
+std::unique_ptr<char[]> allocation; // 内存分配器
+```
+
+对于每个数据块在最后有5个字节：(所有插入到block cache中的数据会让page cache失效, 提升内存使用效率)
+   <校验码类型-1字节><校验码-4字节>
+
+
 
